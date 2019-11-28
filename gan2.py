@@ -2,7 +2,7 @@
 import chainer
 import chainer.functions as F
 import chainer.links as L
-from chainer import training, datasets, iterators, optimizers
+from chainer import training, datasets, iterators, optimizers, cuda
 from chainer.training import extensions
 from chainer.datasets import TupleDataset
 import numpy as np
@@ -22,129 +22,170 @@ if uses_device >= 0:
 else:
 	cp = np
 
+xp = cuda.cupy
+def calc_mean_std(feature, eps = 1e-5):
+    batch, channels, _, _ = feature.shape
+    feature_a = feature.data
+    feature_var = xp.var(feature_a.reshape(batch, channels, -1),axis = 2) + eps
+    feature_var = chainer.as_variable(feature_var)
+    feature_std = F.sqrt(feature_var).reshape(batch, channels, 1,1)
+    feature_mean = F.mean(feature.reshape(batch, channels, -1), axis = 2)
+    feature_mean = feature_mean.reshape(batch, channels, 1,1)
+
+    return feature_std, feature_mean
+
+def adain(content_feature, style_feature):
+    shape = content_feature.shape
+    style_std, style_mean = calc_mean_std(style_feature)
+    style_mean = F.broadcast_to(style_mean, shape = shape)
+    style_std = F.broadcast_to(style_std, shape = shape)
+    
+    content_std, content_mean = calc_mean_std(content_feature)
+    content_mean = F.broadcast_to(content_mean, shape = shape)
+    content_std = F.broadcast_to(content_std, shape = shape)
+    normalized_feat = (content_feature - content_mean) / content_std
+
+    return normalized_feat * style_std + style_mean
+
+class VGG(chainer.Chain):
+
+	def __init__(self):
+		w = chainer.initializers.GlorotUniform()
+		super(VGG, self).__init__()
+		with self.init_scope():
+			self.base = L.VGG16Layers()
+
+			self.c0=L.Convolution2D(512, 512, 4, 2, 1, initialW=w)
+			self.c1=L.Convolution2D(512, 512, 3, 1, 1, initialW=w)
+
+			self.bnc0=L.BatchNormalization(512)
+			self.bnc1=L.BatchNormalization(512)
+
+	def __call__(self, x):
+		h = F.relu(self.base(x, layers=['conv4_3'])['conv4_3'])
+		h = F.relu(self.bnc0(self.c0(h)))
+		h = F.relu(self.bnc1(self.c1(h)))
+
+		return h
+
+class CBR(chainer.Chain):
+
+	def __init__(self, in_ch, out_ch):
+		w = chainer.initializers.GlorotUniform()
+		super(CBR, self).__init__()
+		with self.init_scope():
+			self.c0 = L.Convolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
+			self.bn0 = L.BatchNormalization(out_ch)
+
+	def __call__(self, x):
+		h = F.relu(self.bn0(self.c0(x)))
+
+		return h
+
+class ResBlock(chainer.Chain):
+
+	def __init__(self, in_ch, out_ch):
+		w = chainer.initializers.GlorotUniform()
+		super(ResBlock, self).__init__()
+		with self.init_scope():
+			self.c0 = L.Convolution2D(in_ch, out_ch, 3, 1, 1, initialW=w)
+			self.c1 = L.Convolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+
+			self.bn0 = L.BatchNormalization(out_ch)
+			self.bn1 = L.BatchNormalization(out_ch)
+
+	def __call__(self, x):
+		h = F.relu(self.bn0(self.c0(x)))
+		h = self.bn1(self.c1(h))
+
+		return h + x
+
+class AdainResBlock(chainer.Chain):
+
+	def __init__(self, in_ch, out_ch):
+		w = chainer.initializers.GlorotUniform()
+		super(AdainResBlock, self).__init__()
+		with self.init_scope():
+			self.c0 = L.Convolution2D(in_ch, out_ch, 3, 1, 1, initialW=w)
+			self.c1 = L.Convolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+
+	def __call__(self, x, z):
+		h = F.relu(adain(self.c0(x), z))
+		h = F.relu(adain(self.c1(h), z))
+
+		return h + x
+
+class Upsamp(chainer.Chain):
+
+	def __init__(self, in_ch, out_ch):
+		w = chainer.initializers.GlorotUniform()
+		super(Upsamp, self).__init__()
+		with self.init_scope():
+			self.c0 = L.Deconvolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
+			self.bn0 = L.BatchNormalization(out_ch)
+
+	def __call__(self, x):
+		h = F.relu(self.bn0(self.c0(x)))
+
+		return h
+
 # ベクトルから画像を生成するNN
 class DCGAN_Generator_NN(chainer.Chain):
 
-	def __init__(self):
+	def __init__(self,base = 32):
 		# 重みデータの初期値を指定する
-		w = chainer.initializers.Normal(scale=0.02, dtype=None)
+		w = chainer.initializers.GlorotUniform()
+		# 全ての層を定義する
 		super(DCGAN_Generator_NN, self).__init__()
 		with self.init_scope():
 			#ヒント画像
-			self.vgg16 = L.VGG16Layers()
+			self.vgg16 = VGG()
 
-			self.v16x2c0=L.Convolution2D(512, 512, 4, 2, 1, initialW=w)
-			self.v16x2c1=L.Convolution2D(512, 512, 3, 1, 1, initialW=w)
+			# Input layer
+			self.c0 = L.Convolution2D(3, base, 3, 1, 1, initialW=w)
+			self.bnc0 = L.BatchNormalization(base)
 
-			self.bnv16x2c0=L.BatchNormalization(512)
-			self.bnv16x2c1=L.BatchNormalization(512)
+			# UNet
+			self.cbr0 = CBR(base, base*2)
+			self.cbr1 = CBR(base*2, base*4)
+			self.cbr2 = CBR(base*4, base*8)
+			self.cbr3 = CBR(base*8, base*16)
+			self.res0 = ResBlock(base*16, base*16)
+			self.res1 = ResBlock(base*16, base*16)
+			self.ad0 = AdainResBlock(base*16, base*16)
+			self.ad1 = AdainResBlock(base*16, base*16)
+			self.ad2 = AdainResBlock(base*16, base*16)
+			self.ad3 = AdainResBlock(base*16, base*16)
+			self.up0 = Upsamp(base*16, base*8)
+			self.up1 = Upsamp(base*16, base*4)
+			self.up2 = Upsamp(base*8, base*2)
+			self.up3 = Upsamp(base*4, base)
 
-			#vgg16
-			self.v16c0=L.Convolution2D(512, 512, 4, 2, 1, initialW=w)
-			self.v16c1=L.Convolution2D(512, 512, 3, 1, 1, initialW=w)
-
-			self.bnv16c0=L.BatchNormalization(512)
-			self.bnv16c1=L.BatchNormalization(512)
-
-			#U-Net
-			self.c0=L.Convolution2D(3, 32, 3, 1, 1, initialW=w)
-			self.c1=L.Convolution2D(32, 64, 4, 2, 1, initialW=w)
-			self.c2=L.Convolution2D(64, 64, 3, 1, 1, initialW=w)
-			self.c3=L.Convolution2D(64, 128, 4, 2, 1, initialW=w)
-			self.c4=L.Convolution2D(128, 128, 3, 1, 1, initialW=w)
-			self.c5=L.Convolution2D(128, 256, 4, 2, 1, initialW=w)
-			self.c6=L.Convolution2D(256, 256, 3, 1, 1, initialW=w)
-			self.c7=L.Convolution2D(256, 512, 4, 2, 1, initialW=w)
-			self.c8=L.Convolution2D(512, 512, 3, 1, 1, initialW=w)
-
-			self.r0=L.Convolution2D(2048, 512, 3, 1, 1, initialW=w)
-			self.r1=L.Convolution2D(1024, 512, 3, 1, 1, initialW=w)
-			self.r2=L.Convolution2D(1024, 512, 3, 1, 1, initialW=w)
-			self.r3=L.Convolution2D(1024, 512, 3, 1, 1, initialW=w)
-
-			self.dc8=L.Deconvolution2D(1024, 512, 4, 2, 1, initialW=w)
-			self.dc7=L.Convolution2D(512, 256, 3, 1, 1, initialW=w)
-			self.dc6=L.Deconvolution2D(512, 256, 4, 2, 1, initialW=w)
-			self.dc5=L.Convolution2D(256, 128, 3, 1, 1, initialW=w)
-			self.dc4=L.Deconvolution2D(256, 128, 4, 2, 1, initialW=w)
-			self.dc3=L.Convolution2D(128, 64, 3, 1, 1, initialW=w)
-			self.dc2=L.Deconvolution2D(128, 64, 4, 2, 1, initialW=w)
-			self.dc1=L.Convolution2D(64, 32, 3, 1, 1, initialW=w)
-			self.dc0=L.Convolution2D(64, 3, 3, 1, 1, initialW=w)
-
-			self.bnc0=L.BatchNormalization(32)
-			self.bnc1=L.BatchNormalization(64)
-			self.bnc2=L.BatchNormalization(64)
-			self.bnc3=L.BatchNormalization(128)
-			self.bnc4=L.BatchNormalization(128)
-			self.bnc5=L.BatchNormalization(256)
-			self.bnc6=L.BatchNormalization(256)
-			self.bnc7=L.BatchNormalization(512)
-			self.bnc8=L.BatchNormalization(512)
-
-			self.bnr0=L.BatchNormalization(512)
-			self.bnr1=L.BatchNormalization(512)
-			self.bnr2=L.BatchNormalization(512)
-			self.bnr3=L.BatchNormalization(512)
-
-			self.bnd8=L.BatchNormalization(512)
-			self.bnd7=L.BatchNormalization(256)
-			self.bnd6=L.BatchNormalization(256)
-			self.bnd5=L.BatchNormalization(128)
-			self.bnd4=L.BatchNormalization(128)
-			self.bnd3=L.BatchNormalization(64)
-			self.bnd2=L.BatchNormalization(64)
-			self.bnd1=L.BatchNormalization(32)
-
+			# Output layer
+			self.c1 = L.Convolution2D(base, 3, 3, 1, 1, initialW=w)
+			
 	def __call__(self, x1,x2):
-		#ヒント画像
-		v16x2e0 = F.relu(self.vgg16(x2, layers=['conv4_3'])['conv4_3'])
-		v16x2e1 = F.relu(self.bnv16x2c0(self.v16x2c0(v16x2e0)))
-		v16x2e2 = F.relu(self.bnv16x2c1(self.v16x2c1(v16x2e1)))
-
-		#vgg16
-		v16e0 = F.relu(self.vgg16(x1, layers=['conv4_3'])['conv4_3'])
-		v16e1 = F.relu(self.bnv16c0(self.v16c0(v16e0)))
-		v16e2 = F.relu(self.bnv16c1(self.v16c1(v16e1)))
+		v16 = self.vgg16(x2)
 
 		#U-Net
 		e0 = F.relu(self.bnc0(self.c0(x1)))
-		e1 = F.relu(self.bnc1(self.c1(e0)))
-		e2 = F.relu(self.bnc2(self.c2(e1)))
-		del e1
-		e3 = F.relu(self.bnc3(self.c3(e2)))
-		e4 = F.relu(self.bnc4(self.c4(e3)))
-		del e3
-		e5 = F.relu(self.bnc5(self.c5(e4)))
-		e6 = F.relu(self.bnc6(self.c6(e5)))
-		del e5
-		e7 = F.relu(self.bnc7(self.c7(e6)))
-		e8 = F.relu(self.bnc8(self.c8(e7)))
-
-		rs0 = F.relu(self.bnr0(self.r0(F.concat([e7, e8, v16e2, v16x2e2]))))
-		rs1 = F.relu(self.bnr1(self.r1(F.concat([e8, rs0]))))
-		rs2 = F.relu(self.bnr2(self.r2(F.concat([rs0, rs1]))))
-		rs3 = F.relu(self.bnr3(self.r3(F.concat([rs1, rs2]))))
-
-		d8 = F.relu(self.bnd8(self.dc8(F.concat([e8, rs3]))))
-		del e7, e8
-		d7 = F.relu(self.bnd7(self.dc7(d8)))
-		del d8
-		d6 = F.relu(self.bnd6(self.dc6(F.concat([e6, d7]))))
-		del d7, e6
-		d5 = F.relu(self.bnd5(self.dc5(d6)))
-		del d6
-		d4 = F.relu(self.bnd4(self.dc4(F.concat([e4, d5]))))
-		del d5, e4
-		d3 = F.relu(self.bnd3(self.dc3(d4)))
-		del d4
-		d2 = F.relu(self.bnd2(self.dc2(F.concat([e2, d3]))))
-		del d3, e2
-		d1 = F.relu(self.bnd1(self.dc1(d2)))
-		del d2
-		d0 = F.sigmoid(self.dc0(F.concat([e0, d1])))
+		e1 = self.cbr0(e0)
+		e2 = self.cbr1(e1)
+		e3 = self.cbr2(e2)
+		e4 = self.cbr3(e3)
+		r0 = self.res0(e4)
+		r1 = self.res1(r0)
+		a0 = self.ad0(r1,v16)
+		a1 = self.ad1(a0,v16)
+		a2 = self.ad2(a1,v16)
+		a3 = self.ad3(a2,v16)
+		d0 = self.up0(a3)
+		d1 = self.up1(F.concat([d0, e3]))
+		d2 = self.up2(F.concat([d1, e2]))
+		d3 = self.up3(F.concat([d2, e1]))
+		d4 = F.sigmoid(self.c1(d3))
 		
-		return d0	# 結果を返すのみ
+		return d4	# 結果を返すのみ
 
 # ニューラルネットワークを作成
 model = DCGAN_Generator_NN()
@@ -157,7 +198,7 @@ if uses_device >= 0:
 	model.to_gpu()
 
 # 学習結果を読み込む
-chainer.serializers.load_hdf5( 'gan-gen.hdf5', model )
+chainer.serializers.load_hdf5( 'gan-gen-30.hdf5', model )
 
 
 # 画像を生成する
@@ -165,13 +206,13 @@ chainer.serializers.load_hdf5( 'gan-gen.hdf5', model )
 listdataset1 = []
 listdataset2 = []
 
-fs = os.listdir('/home/nagalab/soutarou/dcgan/images')
+fs = os.listdir('/home/nagalab/soutarou/colorrization/images')
 fs.sort()
 
 for fn in fs:
 	#print(fn)
 	# 画像を読み込んで128×128ピクセルにリサイズ
-	img = Image.open('/home/nagalab/soutarou/dcgan/images/' + fn).convert('RGB').resize((128, 128))
+	img = Image.open('/home/nagalab/soutarou/colorrization/images/' + fn).convert('RGB').resize((128, 128))
 
 	if 'png' in fn:
 		# 画素データを0〜1の領域にする

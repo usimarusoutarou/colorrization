@@ -1,7 +1,7 @@
 import chainer
 import chainer.functions as F
 import chainer.links as L
-from chainer import training, datasets, iterators, optimizers ,reporter
+from chainer import training, datasets, iterators, optimizers ,reporter,cuda
 from chainer.training import extensions
 from chainer.datasets import TupleDataset
 import numpy as np
@@ -19,6 +19,31 @@ if uses_device >= 0:
 	import chainer.cuda
 else:
 	cp = np
+
+xp = cuda.cupy
+def calc_mean_std(feature, eps = 1e-5):
+    batch, channels, _, _ = feature.shape
+    feature_a = feature.data
+    feature_var = xp.var(feature_a.reshape(batch, channels, -1),axis = 2) + eps
+    feature_var = chainer.as_variable(feature_var)
+    feature_std = F.sqrt(feature_var).reshape(batch, channels, 1,1)
+    feature_mean = F.mean(feature.reshape(batch, channels, -1), axis = 2)
+    feature_mean = feature_mean.reshape(batch, channels, 1,1)
+
+    return feature_std, feature_mean
+
+def adain(content_feature, style_feature):
+    shape = content_feature.shape
+    style_std, style_mean = calc_mean_std(style_feature)
+    style_mean = F.broadcast_to(style_mean, shape = shape)
+    style_std = F.broadcast_to(style_std, shape = shape)
+    
+    content_std, content_mean = calc_mean_std(content_feature)
+    content_mean = F.broadcast_to(content_mean, shape = shape)
+    content_std = F.broadcast_to(content_std, shape = shape)
+    normalized_feat = (content_feature - content_mean) / content_std
+
+    return normalized_feat * style_std + style_mean
 
 class VGG(chainer.Chain):
 
@@ -83,8 +108,8 @@ class AdainResBlock(chainer.Chain):
 			self.c1 = L.Convolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
 
 	def __call__(self, x, z):
-		h = F.relu(adain((self.c0(x)),z))
-		h = F.relu(adain((self.c0(h)),z))
+		h = F.relu(adain(self.c0(x), z))
+		h = F.relu(adain(self.c1(h), z))
 
 		return h + x
 
@@ -94,11 +119,17 @@ class Upsamp(chainer.Chain):
 		w = chainer.initializers.GlorotUniform()
 		super(Upsamp, self).__init__()
 		with self.init_scope():
-			self.c0 = L.Deconvolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
-			self.bn0 = L.BatchNormalization(out_ch)
+			self.d0 = L.Deconvolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
+			self.d1 = L.Deconvolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+			self.c0 = L.Convolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+			self.bnd0 = L.BatchNormalization(out_ch)
+			self.bnd1 = L.BatchNormalization(out_ch)
+			self.bnc0 = L.BatchNormalization(out_ch)
 
 	def __call__(self, x):
-		h = F.relu(self.bn0(self.c0(x)))
+		h = F.relu(self.bnd0(self.d0(x)))
+		h = F.relu(self.bnd1(self.d1(h)))
+		h = F.relu(self.bnc0(self.c0(h)))
 
 		return h
 
@@ -125,13 +156,17 @@ class DCGAN_Generator_NN(chainer.Chain):
 			self.cbr3 = CBR(base*8, base*16)
 			self.res0 = ResBlock(base*16, base*16)
 			self.res1 = ResBlock(base*16, base*16)
+			self.ad0 = AdainResBlock(base*16, base*16)
+			self.ad1 = AdainResBlock(base*16, base*16)
+			self.ad2 = AdainResBlock(base*16, base*16)
+			self.ad3 = AdainResBlock(base*16, base*16)
 			self.up0 = Upsamp(base*16, base*8)
 			self.up1 = Upsamp(base*16, base*4)
 			self.up2 = Upsamp(base*8, base*2)
 			self.up3 = Upsamp(base*4, base)
 
 			# Output layer
-			self.c1 = L.Convolution2D(base, 3, 3, 1, 1, initialW=w)
+			self.c1 = L.Convolution2D(base*2, 3, 3, 1, 1, initialW=w)
 			
 	def __call__(self, x1,x2):
 		v16 = self.vgg16(x2)
@@ -144,11 +179,15 @@ class DCGAN_Generator_NN(chainer.Chain):
 		e4 = self.cbr3(e3)
 		r0 = self.res0(e4)
 		r1 = self.res1(r0)
-		d0 = self.up0(r1)
+		a0 = self.ad0(r1,v16)
+		a1 = self.ad1(a0,v16)
+		a2 = self.ad2(a1,v16)
+		a3 = self.ad3(a2,v16)
+		d0 = self.up0(a3)
 		d1 = self.up1(F.concat([d0, e3]))
 		d2 = self.up2(F.concat([d1, e2]))
 		d3 = self.up3(F.concat([d2, e1]))
-		d4 = F.sigmoid(self.c1(d3))
+		d4 = F.sigmoid(self.c1(F.concat([d3,e0])))
 		
 		return d4	# 結果を返すのみ
 
@@ -253,12 +292,12 @@ if uses_device >= 0:
 listdataset1 = []
 listdataset2 = []
 
-fs = os.listdir('/home/nagalab/soutarou/dcgan/images')
+fs = os.listdir('/home/nagalab/soutarou/colorrization/images')
 fs.sort()
 
 for fn in fs:
 	# 画像を読み込んで128×128ピクセルにリサイズ
-	img = Image.open('/home/nagalab/soutarou/dcgan/images/' + fn).convert('RGB').resize((128, 128))
+	img = Image.open('/home/nagalab/soutarou/colorrization/images/' + fn).convert('RGB').resize((128, 128))
 
 	if 'png' in fn:
 		# 画素データを0〜1の領域にする
