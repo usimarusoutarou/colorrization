@@ -121,11 +121,17 @@ class Upsamp(chainer.Chain):
 		w = chainer.initializers.GlorotUniform()
 		super(Upsamp, self).__init__()
 		with self.init_scope():
-			self.c0 = L.Deconvolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
-			self.bn0 = L.BatchNormalization(out_ch)
+			self.d0 = L.Deconvolution2D(in_ch, out_ch, 4, 2, 1, initialW=w)
+			self.d1 = L.Deconvolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+			self.c0 = L.Convolution2D(out_ch, out_ch, 3, 1, 1, initialW=w)
+			self.bnd0 = L.BatchNormalization(out_ch)
+			self.bnd1 = L.BatchNormalization(out_ch)
+			self.bnc0 = L.BatchNormalization(out_ch)
 
 	def __call__(self, x):
-		h = F.relu(self.bn0(self.c0(x)))
+		h = F.relu(self.bnd0(self.d0(x)))
+		h = F.relu(self.bnd1(self.d1(h)))
+		h = F.relu(self.bnc0(self.c0(h)))
 
 		return h
 
@@ -162,7 +168,7 @@ class DCGAN_Generator_NN(chainer.Chain):
 			self.up3 = Upsamp(base*4, base)
 
 			# Output layer
-			self.c1 = L.Convolution2D(base, 3, 3, 1, 1, initialW=w)
+			self.c1 = L.Convolution2D(base*2, 3, 3, 1, 1, initialW=w)
 			
 	def __call__(self, x1,x2):
 		v16 = self.vgg16(x2)
@@ -183,9 +189,43 @@ class DCGAN_Generator_NN(chainer.Chain):
 		d1 = self.up1(F.concat([d0, e3]))
 		d2 = self.up2(F.concat([d1, e2]))
 		d3 = self.up3(F.concat([d2, e1]))
-		d4 = F.sigmoid(self.c1(d3))
+		d4 = F.sigmoid(self.c1(F.concat([d3,e0])))
 		
 		return d4	# 結果を返すのみ
+
+# 画像を確認するNN
+class DCGAN_Discriminator_NN(chainer.Chain):
+
+	def __init__(self):
+		# 重みデータの初期値を指定する
+		w = chainer.initializers.GlorotUniform()
+		super(DCGAN_Discriminator_NN, self).__init__()
+		# 全ての層を定義する
+		with self.init_scope():
+			self.c0_0 = L.Convolution2D(3, 8, 3, 1, 1, initialW=w)
+			self.c0_1 = L.Convolution2D(8, 16, 4, 2, 1, initialW=w)
+			self.c1_0 = L.Convolution2D(16, 16, 3, 1, 1, initialW=w)
+			self.c1_1 = L.Convolution2D(16, 32, 4, 2, 1, initialW=w)
+			self.c2_0 = L.Convolution2D(32, 32, 3, 1, 1, initialW=w)
+			self.c2_1 = L.Convolution2D(32, 64, 4, 2, 1, initialW=w)
+			self.c3_0 = L.Convolution2D(64, 64, 3, 1, 1, initialW=w)
+			self.l4 = L.Linear(128 * 128, 1, initialW=w)
+			self.bn0_1 = L.BatchNormalization(16, use_gamma=False)
+			self.bn1_0 = L.BatchNormalization(16, use_gamma=False)
+			self.bn1_1 = L.BatchNormalization(32, use_gamma=False)
+			self.bn2_0 = L.BatchNormalization(32, use_gamma=False)
+			self.bn2_1 = L.BatchNormalization(64, use_gamma=False)
+			self.bn3_0 = L.BatchNormalization(64, use_gamma=False)
+
+	def __call__(self, x):
+		h = F.leaky_relu(self.c0_0(x))
+		h = F.dropout(F.leaky_relu(self.bn0_1(self.c0_1(h))),ratio=0.2)
+		h = F.dropout(F.leaky_relu(self.bn1_0(self.c1_0(h))),ratio=0.2)
+		h = F.dropout(F.leaky_relu(self.bn1_1(self.c1_1(h))),ratio=0.2)
+		h = F.dropout(F.leaky_relu(self.bn2_0(self.c2_0(h))),ratio=0.2)
+		h = F.dropout(F.leaky_relu(self.bn2_1(self.c2_1(h))),ratio=0.2)
+		h = F.dropout(F.leaky_relu(self.bn3_0(self.c3_0(h))),ratio=0.2)
+		return self.l4(h)	# 結果を返すのみ
 
 # ニューラルネットワークを作成
 model = DCGAN_Generator_NN()
