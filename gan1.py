@@ -22,11 +22,11 @@ else:
 
 class VGG(chainer.Chain):
 
-    def __init__(self):
-        super(VGG, self).__init__()
-
-        with self.init_scope():
-        	self.base = L.VGG16Layers()
+	def __init__(self):
+		w = chainer.initializers.GlorotUniform()
+		super(VGG, self).__init__()
+		with self.init_scope():
+			self.base = L.VGG16Layers()
 
 			self.c0=L.Convolution2D(512, 512, 4, 2, 1, initialW=w)
 			self.c1=L.Convolution2D(512, 512, 3, 1, 1, initialW=w)
@@ -34,12 +34,12 @@ class VGG(chainer.Chain):
 			self.bnc0=L.BatchNormalization(512)
 			self.bnc1=L.BatchNormalization(512)
 
-    def __call__(self, x):
-        h = F.relu(self.bace(x, layers=['conv4_3'])['conv4_3'])
-		h = F.relu(self.bnc0(self.v16c0(h)))
-		h = F.relu(self.bnc1(self.v16c1(h)))
+	def __call__(self, x):
+		h = F.relu(self.base(x, layers=['conv4_3'])['conv4_3'])
+		h = F.relu(self.bnc0(self.c0(h)))
+		h = F.relu(self.bnc1(self.c1(h)))
 
-        return h
+		return h
 
 # ベクトルから画像を生成するNN
 class DCGAN_Generator_NN(chainer.Chain):
@@ -251,8 +251,8 @@ if uses_device >= 0:
 	model_gen.to_gpu()
 	model_dis.to_gpu()
 
-chainer.serializers.load_hdf5( 'gan-gen.hdf5', model_gen )
-chainer.serializers.load_hdf5( 'gan-dis.hdf5', model_dis )
+#chainer.serializers.load_hdf5( 'gan-gen.hdf5', model_gen )
+#chainer.serializers.load_hdf5( 'gan-dis.hdf5', model_dis )
 
 listdataset1 = []
 listdataset2 = []
